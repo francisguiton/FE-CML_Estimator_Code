@@ -1,0 +1,493 @@
+****************************************************
+****************************************************
+*** Program for FE-CML Estimator in Stata ***
+***************** Francis Guiton *****************
+******************  August 2019 ******************
+****************************************************
+****************************************************
+
+
+****************************************************
+****************************************************
+// 1- Defining the command syntax
+****************************************************
+****************************************************
+
+program suffclme, eclass
+	version 13
+	
+// Dynamic forward-looking multinomial logit estimation
+// Note: Data should be in panel format (i.e. panel and time variables should already be defined in Stata using xtset)
+
+	args y
+
+// We call on "suffcomp" ado file to run the required computations
+
+	mata: mata clear
+	suffcomp `y' 
+	
+// We store and display the estimation results
+
+if("$forward" == "1")&("$duration" == "1")&("$level"<="2") {
+matrix colnames results = Beta_* d_*
+ereturn post results
+ereturn display
+}
+
+if(("$forward" == "0")&("$duration" == "0")&("$level"<="2"))|(("$forward" == "1")&("$duration" == "0")&("$level"<="2"))|(("$forward" == "0")&("$duration" == "1")&("$level"<="2"))|(("$forward" == "0")&("$duration" == "0")&("$level">"2"))|(("$forward" == "1")&("$duration" == "0")&("$level">"2"))|(("$forward" == "0")&("$duration" == "1")&("$level">"2"))|(("$forward" == "1")&("$duration" == "1")&("$level">"2")) {
+
+	matrix colnames b= $betalist
+	matrix colnames V= $betalist
+	matrix rownames V= $betalist
+	ereturn post b V
+	ereturn display
+
+}
+
+end
+
+****************************************************
+****************************************************
+// 2- Computing choice histories and defining log-likelihood function
+****************************************************
+****************************************************
+
+program define suffcomp, rclass
+	version 13	
+
+	args choice
+	set more off
+	
+	qui tab `choice'
+	qui ret li
+	global level = r(r)
+	qui summ `choice'
+	global minchoice = r(min)
+	qui levelsof `choice', local(alternatives)
+	
+// This program runs the necessary computations for our estimation
+
+	quietly {
+		xtset
+		return list
+		global T= r(tmax)
+		global id= r(panelvar)
+		global time= r(timevar)
+		levelsof $id, local(id_val)
+		local id_count: word count `id_val'
+		global N = `id_count'	
+		sum
+		return list
+		local total_n = r(N)	
+	}	
+
+	if $T != `total_n'/$N {
+	di as err "Panel must be balanced"
+	exit 498
+	}
+	
+
+// First, we input the observed choice histories into a matrix Y; 
+// Each column i represents the choice history for observation i in the data
+	
+	forvalues i = 1(1)$N {
+	qui des
+	qui return list
+	local lh`i'= ((r(N)*(`i'-1))/$N) + 1
+	local rh`i'= (r(N)*`i')/$N
+	mata: y`i' = st_data((`lh`i'', `rh`i''), "`choice'") 
+	if(`i'==1) {
+	mata: Y= (.)
+	mata: Y= y`i'
+	}
+	else {
+	mata: Y= (Y, y`i')
+	}
+	}
+
+// Next, we generate all possible binary strings representing choice histories (independently of the data);
+// Note: for base version of Stata, T can be no larger than 10 (otherwise, too many variables are created)
+
+
+	qui tab `choice', matrow(level)
+	global size = (rowsof(level))^$T
+	global choice = rowsof(level)
+	qui preserve
+	qui clear
+	qui set obs $choice
+	qui svmat level, n(level)
+	rename level1 level
+	qui putmata level
+	qui restore
+
+	mata {
+	level = level'
+	b = combrep(level, $T)
+	b = b'
+	c = cols(b)
+	B = J($T ,1,.)
+
+	for (i=1; i<=c; i++) {
+	x = b[.,i]
+	info = cvpermutesetup(x)
+		while ((p=cvpermute(info)) != J(0,1,.)) {
+		if(i==1) {
+		B = p
+		} 
+		else {
+		B = (B,p)
+		}
+		}
+	}
+	}
+
+// Here, we calculate sufficient and identifying statistics by calling on the "suffident" ado. file;
+// Note: we calculate the statistics for both the observed histories (y), and the binary strings we previously generated (b)
+
+// We ask the user if the model will include duration dependence, and if agents are myopic or forward-looking.
+
+display `"Duration Dependence? Yes = 1; No  = 0 "' _request(duration)
+scalar duration = $duration
+display `"Myopic or Forward-Looking Agents? Forward-Looking = 1; Myopic  = 0 "' _request(forward)
+scalar forward = $forward
+		
+	if(forward == 1)&(duration == 1)&("$level"<="2"){
+	binsuffidentfd `choice' 
+	}
+	
+	else {	
+	
+	if(forward == 0)&(duration == 0)&("$level"<="2"){
+	binsuffidentm `choice' b
+	}	
+	
+	if(forward == 1)&(duration == 0)&("$level"<="2"){
+	binsuffidentm `choice' b
+	}
+
+	if(forward == 0)&(duration == 1)&("$level"<="2"){
+	binsuffidentmd `choice' b
+	}
+
+	if(forward == 0)&(duration == 0)&("$level">"2"){
+	multsuffidentm `choice' b
+	}
+
+	if(forward == 1)&(duration == 0)&("$level">"2"){
+	multsuffidentm `choice' b
+	}
+
+	if(forward == 0)&(duration == 1)&("$level">"2"){
+	multsuffidentmd `choice' b
+	}
+
+	if(forward == 1)&(duration == 1)&("$level">"2"){
+	multsuffidentfd `choice' b
+	}
+
+	mata: st_matrix("Sy", Sy)
+	mata: st_matrix("Uy", Uy)
+	mata: st_matrix("Sb", Sb)
+	mata: st_matrix("Ub", Ub)
+	
+		
+// In order to perform the iterations, we call on the mata function "sufftest" defined below
+		
+	qui {
+	mata: suffest(Sy, Uy, Sb, Ub, selhist)
+
+	mata: zero_check = rowsum(st_matrix("dlogLbeta"))
+	mata: zero_check = colsum(st_matrix("dlogLbeta"))
+	mata: st_matrix("zero_check", zero_check)
+	scalar check = zero_check[1,1]
+	}
+
+	if check == 0 {
+	di as err "Parameters cannot be identified"
+	exit 498
+	}
+		
+	svmat bet
+
+	scalar dim1 = dimens[1,1] - 1
+	local dim1 = dim1
+	
+	if(`dim1'==0) {
+	scalar beta = bet[1]
+	}
+	
+	else {
+	forvalues i = 0(1)`dim1' {
+	scalar beta_`i' = bet[`i'+1]
+	}
+	}
+
+	global betalist
+	if(`dim1'==0) {
+	global betalist "$betalist beta"
+	}
+	
+	else {
+	foreach p of local alternatives {
+	foreach q of local alternatives {
+	if (`p'==`q'){
+	continue
+	}
+	global betalist "$betalist beta_`p'`q'"
+	}
+	}
+	}
+
+	drop bet
+
+	}
+	
+end
+
+version 13
+
+mata: 
+	
+// First we define function to generate multinomial histories
+	
+
+	function combrep(v,k) {
+		n = cols(v)
+		a = J(comb(n+k-1,k),k,v[1])
+		u = J(1,k,1)
+		for (i=2; 1; i++) {
+			for (j=k; j>0; j--) {
+				if (u[j]<n) break
+			}
+			if (j<1) return(a)
+			m = u[j]+1
+			for (; j<=k; j++) u[j] = m
+			a[i,.] = v[u]
+		}
+	}
+		
+ 
+// Now, we define log-likelihood and its maximization
+	
+	void suffest(numeric matrix Sy, numeric matrix Uy, numeric matrix Sb, numeric matrix Ub, numeric matrix selhist)
+	
+	{
+		beta0 = J(cols(Sy), 1, 0)
+		Iterations = 1
+		crit1 = 1000
+		crit2 = 1000
+		eps1 = 1e-4
+		eps2 = 1e-2
+		
+	// Start iterations 
+		
+		do {
+		
+		term = Sb*beta0
+		buff = exp(term)
+		sumterm = selhist * buff
+		deriv_term = (Sb :* buff)
+		sumterms = selhist * deriv_term
+		loglike = (colsum(Sy) * beta0) - colsum(ln(sumterm))
+	
+	// Vector of scores
+
+		dlogLbeta = Sy - (sumterms :/ sumterm)
+
+	
+	// Outer product of scores
+
+		d2logLbeta = dlogLbeta' * dlogLbeta
+		
+		beta1 = beta0 + invsym(d2logLbeta) * (colsum(dlogLbeta))'
+		crit1 = sqrt((beta1-beta0)' * (beta1-beta0))
+		crit2 = sqrt(colsum(dlogLbeta) * colsum(dlogLbeta)')
+		
+		beta0 = beta1
+		Iterations = Iterations + 1
+		
+		} while ((crit1>eps1)|(crit2>eps2))&(Iterations < 25)
+
+		term = Sb*beta0
+		buff = exp(term)
+		sumterm = selhist * buff
+		sumterms = selhist * (Sb :* buff)
+		loglike = (colsum(Sy) * beta0) - colsum(ln(sumterm))
+		dlogLbeta = Sy - (sumterms :/ sumterm)
+		d2logLbeta = dlogLbeta' * dlogLbeta
+		
+		Avarb = invsym(d2logLbeta)
+
+		dimens = cols(Sy)
+
+		beta = beta0'
+				
+		// Finally, we pass the estimation results back to Stata
+		st_matrix("bet", beta0)
+		st_matrix("b", beta)
+		st_matrix("V", Avarb)
+		st_matrix("Iterations", Iterations)
+		st_matrix("dimens", dimens)
+		st_matrix("crit1", crit1)
+		st_matrix("crit2", crit2)
+		st_matrix("sumterm", sumterm)
+		st_matrix("sumterms", sumterms)
+		st_matrix("dlogLbeta", dlogLbeta)
+
+		}
+		
+end
+
+****************************************************
+****************************************************
+// 3- Computing identifying and sufficient statistics
+****************************************************
+****************************************************
+
+	program define multsuffidentm, rclass
+		version 13
+		args y b
+
+		qui levelsof `y', local(levels)
+
+
+// This program computes the sufficient and identifying statistics for both the observed choices (y), and the binary strings (b)		
+		
+		qui preserve
+		qui clear
+		qui set obs $T
+		qui gen time=_n
+		qui sort time
+		qui tsset time
+
+		
+// Statistics for the observed choices
+
+		matrix Uy= (.)
+		matrix Sy= (.)
+		forvalues i = 1(1)$N {
+			mata: y`i' = Y[.,`i']
+			getmata y`i'
+			tempvar yo`i' yT`i'
+			qui gen `yo`i'' = y`i'[1] 
+			qui summ `yo`i''
+			scalar a`i' =r(mean)
+			qui gen `yT`i'' = y`i'[$T] 
+			qui summ `yT`i''
+			scalar b`i' = r(mean)
+			matrix Uy`i'= (a`i',b`i')
+		foreach p of local levels{
+			tempvar yt`i'`p'
+			qui egen `yt`i'`p'' = sum(y`i') if(y`i'==`p')
+			qui summ `yt`i'`p''
+			scalar c`i'`p' = r(mean)
+			if (c`i'`p'==.) {
+			scalar c`i'`p' = 0
+			}
+			matrix Uy`i'= (Uy`i', c`i'`p')
+		foreach q of local levels{
+			if (`p'==`q') {
+			if(`p'==$minchoice)&(`q'==$minchoice) {
+			matrix Sy`i' = (.)
+			}
+			continue
+			}
+			tempvar x1`i'`p'`q'
+			qui sort time
+			qui gen `x1`i'`p'`q'' = 0
+			qui replace `x1`i'`p'`q'' = 1 if(y`i'==`p')&(L.y`i'==`q')
+			qui summ `x1`i'`p'`q''
+			scalar e`i'`p'`q'= r(sum)
+			matrix Sy`i'= (Sy`i',e`i'`p'`q')
+			drop `x1`i'`p'`q''
+			}
+			drop `yt`i'`p''
+			}
+			matrix Sy`i' = Sy`i'[1...,2...]
+			if (`i'==1){
+			mata: Uy=st_matrix("Uy`i'")
+			mata: Sy=st_matrix("Sy`i'")
+			}
+			else {
+			mata: Uy= (Uy\st_matrix("Uy`i'")) 
+			mata: Sy= (Sy\st_matrix("Sy`i'"))
+			}
+		drop `yo`i'' `yT`i'' y`i'
+			
+		}
+		
+	
+// Statistics for the binary strings
+
+		matrix Ub= (.)
+		matrix Sb= (.)
+		forvalues i = 1(1)$size {
+			mata: b`i' = B[.,`i']
+			getmata b`i'
+			tempvar bo`i' bT`i'
+			qui gen `bo`i'' = b`i'[1] 
+			qui summ `bo`i''
+			scalar ab`i' =r(mean)
+			qui gen `bT`i'' = b`i'[$T] 
+			qui summ `bT`i''
+			scalar bb`i' = r(mean)
+			matrix Ub`i'= (ab`i', bb`i')
+		foreach p of local levels{
+			tempvar bt`i'`p'
+			qui egen `bt`i'`p'' = sum(b`i') if(b`i'==`p')
+			qui summ `bt`i'`p''
+			scalar cb`i'`p' = r(mean)
+			if (cb`i'`p' ==.) {
+			scalar cb`i'`p' = 0
+			}
+			matrix Ub`i'= (Ub`i', cb`i'`p')
+		foreach q of local levels{
+			if (`p'==`q') {
+			if(`p'==$minchoice)&(`q'==$minchoice) {
+			matrix Sb`i' = (.)
+			}
+			continue
+			}
+			tempvar x2`i'`p'`q'
+			qui sort time
+			qui gen `x2`i'`p'`q'' = 0
+			qui replace `x2`i'`p'`q'' = 1 if(b`i'==`p')&(L.b`i'==`q')
+			qui summ `x2`i'`p'`q''
+			scalar eb`i'`p'`q'= r(sum)
+			matrix Sb`i'= (Sb`i', eb`i'`p'`q')
+			drop `x2`i'`p'`q'' 
+			}
+			drop `bt`i'`p''
+			}
+			matrix Sb`i' = Sb`i'[1...,2...]
+			if (`i'==1){
+			mata: Ub=st_matrix("Ub`i'")
+			mata: Sb=st_matrix("Sb`i'")
+			}
+			else {
+			mata: Ub= (Ub\st_matrix("Ub`i'")) 
+			mata: Sb= (Sb\st_matrix("Sb`i'"))
+			}
+		drop `bo`i'' `bT`i'' b`i'
+		}
+		
+	mata: selhist = J($N, $size, 0)
+	forvalues i = 1(1)$N {
+	forvalues j = 1(1)$size {
+	mata {
+	if(Uy[`i',.] == Ub[`j',.]) {
+	selhist[`i',`j'] = 1 
+	}
+	}
+	}
+	}
+	
+	mata: st_matrix("selhist", selhist)
+		
+	restore
+
+	end
+
+
+
+
